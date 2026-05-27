@@ -30,7 +30,7 @@ sensitivity-suite:
 
 post-eval:
 	uv run --extra train python scripts/run_sensitivity_analysis.py --plot-only
-	uv run --extra train python scripts/plot_episode_rollout.py
+	uv run --extra train python scripts/plot_episode_rollout.py --plot-only
 
 deploy-demo:
 	cd infra/terraform && terraform init

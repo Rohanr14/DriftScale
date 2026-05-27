@@ -8,7 +8,17 @@ __pycache__/
 Thumbs.db
 
 # DriftScale generated/local artifacts
-results/
+results/**
+!results/
+!results/sensitivity/
+!results/sensitivity/summary.csv
+!results/sensitivity/summary.md
+!results/sensitivity/continuous_rewards.csv
+!results/sensitivity/demand_diagnostics.csv
+!results/sensitivity/*/
+!results/sensitivity/*/continuous_rewards.csv
+!results/sensitivity/*/task_*_calibrated.csv
+!results/sensitivity/*/episode_rollout_curriculum.csv
 data/
 !data/
 !data/samples/

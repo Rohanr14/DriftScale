@@ -25,8 +25,9 @@ vectorized §5.5 demand mappings, tiny local Azure-shaped sample, and cache gene
 **Weeks 5-6 complete:** abrupt Task A -> Task B drift setup, BWT/forgetting metrics,
 naive fine-tuning, and interleaved replay via mixed vectorized environments.
 
-**Sensitivity suite complete:** real local Azure V1 shard loading, top-1,000 dense VM
-selection, chronological Task A/B split, and §5.5 linear/convex/threshold BWT comparison.
+**Sensitivity suite complete:** real local Azure V1 checkpoint loading, per-checkpoint dense
+32-VM cohort selection, drift diagnostics, three-seed continuous fine-tuning/replay, and
+§5.5 linear/convex/threshold BWT comparison.
 
 Validated locally:
 
@@ -40,6 +41,7 @@ make train-baseline
 make drift-experiment
 make fetch-data
 make sensitivity-suite
+make post-eval
 make random-run
 make phase1
 ```
@@ -89,13 +91,16 @@ make drift-experiment
 # 7. Materialize the top-1,000 dense VM matrix from the real local Azure shard
 make fetch-data
 
-# 8. Run chronological Task A/B sensitivity across linear, convex, and threshold mappings
+# 8. Run six-checkpoint sensitivity across linear, convex, and threshold mappings
 make sensitivity-suite
 
-# 9. Run the masked random-policy smoke test
+# 9. Rebuild the forgetting and rollout plots from cached CSV artifacts
+make post-eval
+
+# 10. Run the masked random-policy smoke test
 make random-run
 
-# 10. Evaluate Phase 1 static and reactive baselines
+# 11. Evaluate Phase 1 static and reactive baselines
 make phase1
 ```
 
@@ -128,18 +133,27 @@ Week 3 calibration writes `results/caches/azure_v1_calibrated.csv` and
 Weeks 5-6 write `results/drift_experiment/forgetting.csv` and three saved policy stages:
 Task A pre-drift, naive Task B fine-tuning, and Task B fine-tuning with interleaved replay.
 
-The sensitivity suite reads the real local Azure V1 shard at
-`data/raw/vm_cpu_readings-file-1-of-125.csv.gz`, selects the 1,000 VMs with the most readings,
-pivots a dense CPU matrix, and splits it chronologically into Task A and Task B. It writes
-`results/sensitivity/summary.md`. No synthetic fallback or artificial Task B multiplier is used.
+The sensitivity suite reads the six real local Azure V1 checkpoint shards at
+`data/raw/vm_cpu_readings-file-{1,25,50,75,100,125}-of-125.csv.gz`, selects each checkpoint's own
+32 densest VMs, and rejects the run unless later checkpoints measurably differ from checkpoint 1.
+The latest run used real Azure data, not the synthetic fallback, and writes
+`results/sensitivity/summary.md`, `results/sensitivity/continuous_rewards.csv`, and
+`results/sensitivity/demand_diagnostics.csv`.
 
 **Primary Evaluation: Catastrophic Forgetting vs. Adaptation**
 
-| Method | Task A Reward (Before Drift) | Task A Reward (After Task B) | Forgetting |
-| --- | --- | --- | --- |
-| **Naive Fine-Tuning** (Vanilla PPO) | High | Low | **Severe** |
-| **PPO + EWC** | High | Medium | **Moderate** |
-| **PPO + Replay** | High | High | **Minimal** |
+Final Task-1 backward transfer (BWT = reward after drift training − reward before drift), mean ±
+std over seeds 7, 8, and 9:
+
+| Mapping | Naive BWT | Replay BWT | Naive Forgetting | Replay Forgetting |
+| --- | ---: | ---: | ---: | ---: |
+| Linear | -71.450 ± 344.814 | 159.571 ± 89.758 | 149.161 ± 258.354 | 0.000 ± 0.000 |
+| Convex | -299.276 ± 264.294 | 189.349 ± 103.283 | 299.276 ± 264.294 | 0.000 ± 0.000 |
+| Threshold | -55.595 ± 269.682 | 181.227 ± 97.690 | 118.050 ± 197.253 | 0.000 ± 0.000 |
+
+This run observes forgetting for naive fine-tuning on all three mappings, while interleaved replay
+retains Task-1 reward in the final checkpoint. The variance is still meaningful, so the signed BWT
+is the headline metric and the clamped forgetting value is secondary.
 
 **Secondary Metric:** Cost vs. SLO Pareto frontier comparing Static p95, Reactive Threshold, and PPO + Replay.
 
@@ -192,6 +206,7 @@ To validate that the RL controller can safely interface with cloud APIs, a small
 ## Limitations
 
 * **Simulation Fidelity:** Azure VM CPU traces are not raw service request traces. The mapping loses fidelity for true latency and queueing dynamics, which is why the §5.5 sensitivity analysis is strictly enforced.
+* **Cohort Construction:** The forgetting benchmark now uses per-checkpoint dense VM cohorts to preserve workload-composition drift. Larger VM counts can central-limit-smooth the aggregate demand, so every run saves demand mean/std/p95 plus SMD/KS drift diagnostics before the forgetting metrics are interpreted.
 * **Drift Paradigms:** Real cloud drift is continuous. While this project tests a gradual-drift regime, the primary continual learning methods (EWC/Replay) fundamentally assume distinct task boundaries (Task A → Task B).
 * **SLO Proxy:** The simulation uses capacity-vs-demand as a proxy for SLO violations. Only the live AWS demo generates real `p95` latency metrics.
 * **Reactive scaling is the reference, not the rival:** Whether RL strictly beats reactive scaling on cost/SLO is a secondary finding. The core contribution is the measurement of online adaptation.

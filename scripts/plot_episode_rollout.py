@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mapping", default="linear")
     parser.add_argument("--stage", type=int, default=125)
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--rollout-mode",
         choices=("curriculum", "stage"),
@@ -39,12 +40,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-path")
     parser.add_argument("--csv-path")
     parser.add_argument("--output-path", default="media/episode_rollout.png")
+    parser.add_argument(
+        "--plot-only",
+        action="store_true",
+        help="Redraw the rollout PNG from the cached rollout CSV without loading model artifacts.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     paths = resolve_paths(args)
+    if args.plot_only:
+        rollout = pd.read_csv(paths["csv"])
+        write_rollout_plot(
+            rollout,
+            output_path=paths["output"],
+            title=rollout_title(args),
+            config=rollout_config(
+                train_config_path=paths["train_config"],
+                env_config_path=paths["env_config"],
+                capacity_trace_path=paths["trace_paths"][0],
+            ),
+        )
+        print(f"Updated rollout plot from {paths['csv']}")
+        return
+
     rollout_input = load_rollout_input(
         trace_paths=paths["trace_paths"],
         checkpoints=args.checkpoints,
@@ -65,6 +86,7 @@ def main() -> None:
     model = MaskablePPO.load(str(paths["model"]), env=env)
 
     rollout = collect_rollout(model, env, rollout_input=rollout_input)
+    rollout = add_rollout_diagnostics(rollout, config=config)
     csv_path = paths["csv"]
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     rollout.to_csv(csv_path, index=False)
@@ -72,6 +94,7 @@ def main() -> None:
         rollout,
         output_path=paths["output"],
         title=rollout_title(args),
+        config=config,
     )
     print(f"Saved rollout CSV to {csv_path}")
     print(f"Saved rollout plot to {paths['output']}")
@@ -80,7 +103,9 @@ def main() -> None:
 def resolve_paths(args: argparse.Namespace) -> dict[str, Any]:
     sensitivity_dir = Path(args.sensitivity_dir)
     mapping_dir = sensitivity_dir / args.mapping
-    stage_dir = mapping_dir / f"replay_stage_{args.stage}"
+    seeded_stage_dir = mapping_dir / f"seed_{args.seed}" / f"replay_stage_{args.stage}"
+    legacy_stage_dir = mapping_dir / f"replay_stage_{args.stage}"
+    stage_dir = seeded_stage_dir if seeded_stage_dir.exists() else legacy_stage_dir
     if args.trace_path:
         trace_paths = [Path(args.trace_path)]
     elif args.rollout_mode == "stage":
@@ -105,6 +130,8 @@ def resolve_paths(args: argparse.Namespace) -> dict[str, Any]:
     }
     for label, path in paths.items():
         if label in {"csv", "output"}:
+            continue
+        if args.plot_only and label in {"model", "vecnormalize"}:
             continue
         if label == "trace_paths":
             for trace_path in path:
@@ -226,15 +253,91 @@ def collect_rollout(
     return pd.DataFrame(records)
 
 
+def add_rollout_diagnostics(rollout: pd.DataFrame, *, config: dict[str, Any]) -> pd.DataFrame:
+    updated = rollout.copy()
+    env_cfg = config.get("env", {})
+    capacity_per_task = infer_capacity_per_task(updated, config=config)
+    reactive_tasks = reactive_task_trace(
+        updated["demand"].to_numpy(dtype=np.float32),
+        min_tasks=int(env_cfg.get("min_tasks", 1)),
+        max_tasks=int(env_cfg.get("max_tasks", 20)),
+        initial_tasks=int(env_cfg.get("initial_tasks", 1)),
+        capacity_per_task=capacity_per_task,
+    )
+    updated["capacity_per_task"] = capacity_per_task
+    updated["slo_violation"] = updated["demand"] > updated["capacity"]
+    updated["reactive_task_count"] = reactive_tasks
+    updated["reactive_capacity"] = reactive_tasks.astype(np.float32) * capacity_per_task
+    return updated
+
+
+def infer_capacity_per_task(rollout: pd.DataFrame, *, config: dict[str, Any]) -> float:
+    if "capacity_per_task" in rollout.columns and not rollout["capacity_per_task"].isna().all():
+        return float(rollout["capacity_per_task"].dropna().iloc[0])
+    if "task_count" in rollout.columns and "capacity" in rollout.columns:
+        ratios = rollout["capacity"] / rollout["task_count"].replace(0, np.nan)
+        ratios = ratios.dropna()
+        if not ratios.empty:
+            return float(ratios.median())
+    return float(config.get("env", {}).get("capacity_per_task", 1.0))
+
+
+def reactive_task_trace(
+    demand: np.ndarray,
+    *,
+    min_tasks: int,
+    max_tasks: int,
+    initial_tasks: int,
+    capacity_per_task: float,
+) -> np.ndarray:
+    task_count = int(np.clip(initial_tasks, min_tasks, max_tasks))
+    high_count = 0
+    low_count = 0
+    task_history = []
+    for demand_t in demand:
+        observed_cpu = float(demand_t / max(task_count * capacity_per_task, 1e-8))
+        if observed_cpu > 0.70:
+            high_count += 1
+            low_count = 0
+        elif observed_cpu < 0.30:
+            low_count += 1
+            high_count = 0
+        else:
+            high_count = 0
+            low_count = 0
+
+        if high_count >= 1:
+            task_count = min(max_tasks, task_count + 2)
+            high_count = 0
+        elif low_count >= 6:
+            task_count = max(min_tasks, task_count - 1)
+            low_count = 0
+        task_history.append(task_count)
+    return np.asarray(task_history, dtype=np.int32)
+
+
 def rollout_title(args: argparse.Namespace) -> str:
     if args.rollout_mode == "stage":
-        return f"Stage {args.stage} Replay Rollout ({args.mapping})"
-    return f"Six-Checkpoint Replay Rollout ({args.mapping})"
+        return f"Stage {args.stage} Replay Rollout ({args.mapping}, seed {args.seed})"
+    return f"Six-Checkpoint Replay Rollout ({args.mapping}, seed {args.seed})"
 
 
-def write_rollout_plot(rollout: pd.DataFrame, *, output_path: Path, title: str) -> None:
+def write_rollout_plot(
+    rollout: pd.DataFrame,
+    *,
+    output_path: Path,
+    title: str,
+    config: dict[str, Any],
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure, axis = plt.subplots(figsize=(9.5, 4.8))
+    if "reactive_capacity" not in rollout.columns or "slo_violation" not in rollout.columns:
+        rollout = add_rollout_diagnostics(rollout, config=config)
+    env_cfg = config.get("env", {})
+    capacity_per_task = infer_capacity_per_task(rollout, config=config)
+    min_tasks = int(env_cfg.get("min_tasks", 1))
+    max_tasks = int(env_cfg.get("max_tasks", int(rollout["task_count"].max())))
+
+    figure, axis = plt.subplots(figsize=(10.0, 5.2))
     axis.plot(
         rollout["step"],
         rollout["demand"],
@@ -248,11 +351,48 @@ def write_rollout_plot(rollout: pd.DataFrame, *, output_path: Path, title: str) 
         linewidth=2.0,
         label="Agent Capacity",
     )
+    axis.step(
+        rollout["step"],
+        rollout["reactive_capacity"],
+        where="post",
+        linestyle=":",
+        linewidth=2.0,
+        color="0.25",
+        label="Reactive Capacity",
+    )
+    slo_steps = rollout[rollout["slo_violation"].astype(bool)]
+    if not slo_steps.empty:
+        axis.scatter(
+            slo_steps["step"],
+            slo_steps["demand"],
+            marker="x",
+            s=28,
+            color="tab:red",
+            linewidth=1.2,
+            label="SLO Violation",
+        )
+    task_axis = axis.twinx()
+    task_axis.step(
+        rollout["step"],
+        rollout["task_count"],
+        where="post",
+        color="tab:green",
+        linewidth=1.3,
+        alpha=0.75,
+        label="Agent Tasks",
+    )
     axis.set_xlabel("Timestep")
     axis.set_ylabel("Demand / Capacity")
+    task_axis.set_ylabel("Task Count")
     axis.set_title(title)
     axis.grid(True, alpha=0.25)
-    axis.legend(frameon=False)
+    upper_capacity = max_tasks * capacity_per_task
+    observed_upper = max(float(rollout["demand"].max()), float(rollout["capacity"].max()))
+    axis.set_ylim(0.0, max(upper_capacity, observed_upper) * 1.08)
+    task_axis.set_ylim(max(0, min_tasks - 1), max_tasks + 1)
+    lines, labels = axis.get_legend_handles_labels()
+    task_lines, task_labels = task_axis.get_legend_handles_labels()
+    axis.legend(lines + task_lines, labels + task_labels, frameon=False, loc="upper right")
     if "checkpoint" in rollout.columns and rollout["checkpoint"].nunique() > 1:
         boundaries = rollout.groupby("checkpoint", sort=False)["step"].min().iloc[1:]
         top = max(float(rollout["capacity"].max()), float(rollout["demand"].max()))

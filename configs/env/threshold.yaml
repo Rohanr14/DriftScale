@@ -2,7 +2,7 @@ name: threshold
 
 loader:
   raw_csv_path: data/raw/vm_cpu_readings-file-1-of-125.csv.gz
-  vm_count: 1000
+  vm_count: 32
   chunksize: 250000
   max_rows:
 
@@ -28,7 +28,7 @@ training:
   total_timesteps: 1024
   task_a_timesteps: 20000
   finetune_timesteps: 8192
-  continuous_task_1_timesteps: 4096
-  continuous_finetune_timesteps: 2048
+  continuous_task_1_timesteps: 8192
+  continuous_finetune_timesteps: 4096
   replay_mix_ratio: 0.25
   n_envs: 4

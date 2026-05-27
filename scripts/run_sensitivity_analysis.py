@@ -6,6 +6,7 @@ import argparse
 import copy
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 import numpy as np
@@ -20,8 +21,10 @@ from driftscale.agents.train_ppo import train_maskable_ppo
 from driftscale.agents.train_ppo_replay import train_replay_ppo
 from driftscale.baselines.reactive import ReactiveAutoscaler
 from driftscale.envs.reward import RewardConfig
+from driftscale.eval.drift import demand_distribution_diagnostics, drift_diagnostic_passed
 from driftscale.traces.azure_loader import (
     AZURE_CHECKPOINT_IDS,
+    VmSelectionStrategy,
     load_azure_checkpoint_regimes,
 )
 from driftscale.traces.preprocess import (
@@ -29,6 +32,8 @@ from driftscale.traces.preprocess import (
     build_preprocessed_trace,
     write_preprocessed_trace,
 )
+from driftscale.traces.regimes import WorkloadRegime
+from driftscale.traces.synthetic import generate_synthetic_episode
 from driftscale.utils.config import load_yaml
 
 
@@ -38,6 +43,18 @@ class ContinuousVariantResult:
 
     summary: dict[str, float | int | str]
     trajectory: pd.DataFrame
+    diagnostics: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class Curriculum:
+    """Loaded checkpoint matrices and provenance for the continuous experiment."""
+
+    checkpoint_ids: list[int]
+    matrices: list[pd.DataFrame]
+    selected_vm_count: int
+    selection_strategy: str
+    source: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,9 +74,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-path", default="media/continuous_forgetting.png")
     parser.add_argument("--raw-dir", default="data/raw")
     parser.add_argument("--checkpoints", nargs="+", type=int, default=list(AZURE_CHECKPOINT_IDS))
-    parser.add_argument("--vm-count", type=int, default=1000)
-    parser.add_argument("--chunksize", type=int, default=250_000)
+    parser.add_argument("--vm-count", type=int, default=32)
+    parser.add_argument(
+        "--vm-selection-strategy",
+        choices=[strategy.value for strategy in VmSelectionStrategy],
+        default=VmSelectionStrategy.PER_CHECKPOINT_DENSE.value,
+        help=(
+            "Azure VM cohort selection. per_checkpoint_dense preserves shard-level drift; "
+            "persistent_dense reproduces the old all-shard intersection."
+        ),
+    )
+    parser.add_argument("--chunksize", type=int, default=1_000_000)
     parser.add_argument("--max-rows", type=int)
+    parser.add_argument(
+        "--seed-count",
+        type=int,
+        default=3,
+        help=(
+            "Number of consecutive seeds to run, starting at the PPO config seed unless "
+            "--seeds is supplied. Default 3; runtime scales roughly linearly."
+        ),
+    )
+    parser.add_argument("--seeds", nargs="+", type=int)
+    parser.add_argument(
+        "--task-1-timesteps",
+        type=int,
+        help="Override continuous Task-1 PPO timesteps for every mapping.",
+    )
+    parser.add_argument(
+        "--finetune-timesteps",
+        type=int,
+        help="Override each post-drift fine-tuning stage's PPO timesteps.",
+    )
+    parser.add_argument("--replay-mix-ratio", type=float)
+    parser.add_argument(
+        "--curriculum-source",
+        choices=("auto", "azure", "synthetic"),
+        default="auto",
+        help=(
+            "auto uses real Azure checkpoints when the drift diagnostic passes and falls back "
+            "to labeled synthetic regimes otherwise. Full default run is about 10-30 minutes "
+            "on a laptop with 3 seeds and the bundled PPO budgets."
+        ),
+    )
+    parser.add_argument("--min-drift-smd", type=float, default=0.5)
+    parser.add_argument("--min-drift-ks", type=float, default=0.30)
     parser.add_argument(
         "--plot-only",
         action="store_true",
@@ -91,37 +150,81 @@ def main() -> None:
         print(f"Updated {args.plot_path}")
         return
 
-    regimes = load_azure_checkpoint_regimes(
-        raw_dir=args.raw_dir,
-        checkpoint_ids=tuple(args.checkpoints),
-        vm_count=args.vm_count,
-        chunksize=args.chunksize,
-        max_rows=args.max_rows,
+    seeds = resolve_seeds(args, ppo_base)
+    curriculum = load_curriculum(
+        args,
+        seed=int(ppo_base.get("seed", 0)),
     )
+    validation_diagnostics = matrix_demand_diagnostics(
+        curriculum.matrices,
+        checkpoint_ids=curriculum.checkpoint_ids,
+        mapping="linear_raw",
+        curriculum_source=curriculum.source,
+        vm_selection_strategy=curriculum.selection_strategy,
+        selected_vm_count=curriculum.selected_vm_count,
+        min_drift_smd=args.min_drift_smd,
+        min_drift_ks=args.min_drift_ks,
+    )
+    if curriculum.source == "azure" and not drift_diagnostic_passed(validation_diagnostics):
+        if args.curriculum_source == "azure":
+            raise ValueError(
+                "Azure checkpoint drift diagnostic failed; try a lower --vm-count, a different "
+                "--vm-selection-strategy, or --curriculum-source synthetic."
+            )
+        print(
+            "Azure checkpoint drift diagnostic failed; falling back to labeled synthetic regimes."
+        )
+        curriculum = load_synthetic_curriculum(args, seed=int(ppo_base.get("seed", 0)))
+        validation_diagnostics = matrix_demand_diagnostics(
+            curriculum.matrices,
+            checkpoint_ids=curriculum.checkpoint_ids,
+            mapping="linear_raw",
+            curriculum_source=curriculum.source,
+            vm_selection_strategy=curriculum.selection_strategy,
+            selected_vm_count=curriculum.selected_vm_count,
+            min_drift_smd=args.min_drift_smd,
+            min_drift_ks=args.min_drift_ks,
+        )
+    print("Demand drift diagnostic (linear raw aggregate):")
+    print(format_diagnostic_table(validation_diagnostics))
 
     results = [
         run_mapping_variant(
             config_path,
-            checkpoint_ids=regimes.checkpoint_ids,
-            matrices=regimes.matrices,
-            selected_vm_count=len(regimes.selected_vms),
+            checkpoint_ids=curriculum.checkpoint_ids,
+            matrices=curriculum.matrices,
+            selected_vm_count=curriculum.selected_vm_count,
+            vm_selection_strategy=curriculum.selection_strategy,
+            curriculum_source=curriculum.source,
+            seeds=seeds,
             ppo_base=ppo_base,
             replay_base=replay_base,
             output_dir=output_dir,
+            task_1_timesteps=args.task_1_timesteps,
+            finetune_timesteps=args.finetune_timesteps,
+            replay_mix_ratio=args.replay_mix_ratio,
+            min_drift_smd=args.min_drift_smd,
+            min_drift_ks=args.min_drift_ks,
         )
         for config_path in mapping_configs
     ]
 
     summary = pd.DataFrame([result.summary for result in results])
     trajectories = pd.concat([result.trajectory for result in results], ignore_index=True)
+    diagnostics = pd.concat(
+        [validation_diagnostics, *[result.diagnostics for result in results]],
+        ignore_index=True,
+    )
     summary_path = output_dir / "summary.csv"
     markdown_path = output_dir / "summary.md"
     trajectory_path = output_dir / "continuous_rewards.csv"
+    diagnostics_path = output_dir / "demand_diagnostics.csv"
     summary.to_csv(summary_path, index=False)
     trajectories.to_csv(trajectory_path, index=False)
+    diagnostics.to_csv(diagnostics_path, index=False)
     write_continuous_forgetting_plot(
         trajectories,
-        checkpoint_ids=regimes.checkpoint_ids,
+        checkpoint_ids=curriculum.checkpoint_ids,
         output_path=Path(args.plot_path),
     )
 
@@ -130,15 +233,88 @@ def main() -> None:
     print(markdown)
 
 
+def resolve_seeds(args: argparse.Namespace, ppo_base: dict[str, Any]) -> list[int]:
+    if args.seeds:
+        return list(dict.fromkeys(args.seeds))
+    if args.seed_count <= 0:
+        raise ValueError("--seed-count must be positive")
+    start_seed = int(ppo_base.get("seed", 0))
+    return [start_seed + offset for offset in range(args.seed_count)]
+
+
+def load_curriculum(args: argparse.Namespace, *, seed: int) -> Curriculum:
+    if args.curriculum_source == "synthetic":
+        return load_synthetic_curriculum(args, seed=seed)
+
+    regimes = load_azure_checkpoint_regimes(
+        raw_dir=args.raw_dir,
+        checkpoint_ids=tuple(args.checkpoints),
+        vm_count=args.vm_count,
+        selection_strategy=args.vm_selection_strategy,
+        chunksize=args.chunksize,
+        max_rows=args.max_rows,
+    )
+    selected_counts = [len(selected) for selected in regimes.selected_vms_by_checkpoint]
+    return Curriculum(
+        checkpoint_ids=regimes.checkpoint_ids,
+        matrices=regimes.matrices,
+        selected_vm_count=int(min(selected_counts)),
+        selection_strategy=regimes.selection_strategy,
+        source="azure",
+    )
+
+
+def load_synthetic_curriculum(args: argparse.Namespace, *, seed: int) -> Curriculum:
+    checkpoint_ids = list(args.checkpoints)
+    regime_sequence = [
+        WorkloadRegime.STABLE_DIURNAL,
+        WorkloadRegime.STABLE_DIURNAL,
+        WorkloadRegime.BURSTY,
+        WorkloadRegime.BURSTY,
+        WorkloadRegime.HIGH_SUSTAINED,
+        WorkloadRegime.HIGH_SUSTAINED,
+    ]
+    matrices = []
+    for index, checkpoint_id in enumerate(checkpoint_ids):
+        regime = regime_sequence[min(index, len(regime_sequence) - 1)]
+        episode = generate_synthetic_episode(regime=regime, length=288, seed=seed + index)
+        matrices.append(synthetic_episode_to_cpu_matrix(episode.demand, vm_count=args.vm_count))
+        matrices[-1].index.name = f"synthetic_checkpoint_{checkpoint_id}"
+    return Curriculum(
+        checkpoint_ids=checkpoint_ids,
+        matrices=matrices,
+        selected_vm_count=args.vm_count,
+        selection_strategy="synthetic_regime",
+        source="synthetic",
+    )
+
+
+def synthetic_episode_to_cpu_matrix(demand: np.ndarray, *, vm_count: int) -> pd.DataFrame:
+    if vm_count <= 0:
+        raise ValueError("vm_count must be positive")
+    weights = np.linspace(1.8, 0.4, vm_count, dtype=np.float32)
+    weights = weights / weights.sum()
+    cpu = np.minimum(demand[:, None] * weights[None, :], 1.0)
+    return pd.DataFrame(cpu, columns=[f"synthetic-vm-{index:03d}" for index in range(vm_count)])
+
+
 def run_mapping_variant(
     config_path: Path,
     *,
     checkpoint_ids: list[int],
     matrices: list[pd.DataFrame],
     selected_vm_count: int,
+    vm_selection_strategy: str,
+    curriculum_source: str,
+    seeds: list[int],
     ppo_base: dict,
     replay_base: dict,
     output_dir: Path,
+    task_1_timesteps: int | None,
+    finetune_timesteps: int | None,
+    replay_mix_ratio: float | None,
+    min_drift_smd: float,
+    min_drift_ks: float,
 ) -> ContinuousVariantResult:
     variant_config = load_yaml(config_path)
     variant = str(variant_config["mapping"]["variant"])
@@ -186,7 +362,78 @@ def run_mapping_variant(
         capacity_per_task=capacity_per_task,
     )
 
-    training_cfg = variant_config.get("training", {})
+    diagnostics = demand_diagnostics_from_traces(
+        traces,
+        checkpoint_ids=checkpoint_ids,
+        mapping=variant,
+        curriculum_source=curriculum_source,
+        vm_selection_strategy=vm_selection_strategy,
+        selected_vm_count=selected_vm_count,
+        min_drift_smd=min_drift_smd,
+        min_drift_ks=min_drift_ks,
+    )
+    print(f"Demand drift diagnostic ({variant} mapping):")
+    print(format_diagnostic_table(diagnostics))
+
+    trajectories = [
+        run_mapping_seed(
+            variant=variant,
+            variant_config=variant_config,
+            variant_dir=variant_dir,
+            checkpoint_ids=checkpoint_ids,
+            calibrated_paths=calibrated_paths,
+            reactive_rewards=reactive_rewards,
+            capacity_per_task=capacity_per_task,
+            ppo_base=ppo_base,
+            replay_base=replay_base,
+            seed=seed,
+            task_1_timesteps=task_1_timesteps,
+            finetune_timesteps=finetune_timesteps,
+            replay_mix_ratio=replay_mix_ratio,
+        )
+        for seed in seeds
+    ]
+    trajectory = pd.concat(trajectories, ignore_index=True)
+    trajectory.to_csv(variant_dir / "continuous_rewards.csv", index=False)
+
+    return ContinuousVariantResult(
+        summary=summarize_variant(
+            trajectory,
+            mapping=variant,
+            selected_vm_count=selected_vm_count,
+            vm_selection_strategy=vm_selection_strategy,
+            curriculum_source=curriculum_source,
+            seeds=seeds,
+        ),
+        trajectory=trajectory,
+        diagnostics=diagnostics,
+    )
+
+
+def run_mapping_seed(
+    *,
+    variant: str,
+    variant_config: dict[str, Any],
+    variant_dir: Path,
+    checkpoint_ids: list[int],
+    calibrated_paths: list[Path],
+    reactive_rewards: list[float],
+    capacity_per_task: float,
+    ppo_base: dict[str, Any],
+    replay_base: dict[str, Any],
+    seed: int,
+    task_1_timesteps: int | None,
+    finetune_timesteps: int | None,
+    replay_mix_ratio: float | None,
+) -> pd.DataFrame:
+    training_cfg = dict(variant_config.get("training", {}))
+    if task_1_timesteps is not None:
+        training_cfg["continuous_task_1_timesteps"] = int(task_1_timesteps)
+    if finetune_timesteps is not None:
+        training_cfg["continuous_finetune_timesteps"] = int(finetune_timesteps)
+    if replay_mix_ratio is not None:
+        training_cfg["replay_mix_ratio"] = float(replay_mix_ratio)
+
     task_1_training = {
         **training_cfg,
         "total_timesteps": training_cfg.get(
@@ -201,23 +448,30 @@ def run_mapping_variant(
             training_cfg.get("finetune_timesteps", training_cfg.get("total_timesteps", 1024)),
         ),
     }
-    ppo_task_1 = apply_reward_overrides(
-        with_training_overrides(ppo_base, task_1_training),
-        variant_config,
+    ppo_task_1 = with_seed(
+        apply_reward_overrides(with_training_overrides(ppo_base, task_1_training), variant_config),
+        seed=seed,
     )
-    ppo_finetune = apply_reward_overrides(
-        with_training_overrides(ppo_base, finetune_training),
-        variant_config,
+    ppo_finetune = with_seed(
+        apply_reward_overrides(
+            with_training_overrides(ppo_base, finetune_training),
+            variant_config,
+        ),
+        seed=seed,
     )
-    replay_variant = apply_reward_overrides(
-        with_training_overrides(replay_base, finetune_training),
-        variant_config,
+    replay_variant = with_seed(
+        apply_reward_overrides(
+            with_training_overrides(replay_base, finetune_training),
+            variant_config,
+        ),
+        seed=seed,
     )
 
+    seed_dir = variant_dir / f"seed_{seed}"
     task_1_config = build_single_task_config(
         ppo_task_1,
         trace_path=calibrated_paths[0],
-        output_dir=variant_dir / "naive_stage_1",
+        output_dir=seed_dir / "naive_stage_1",
         capacity_per_task=capacity_per_task,
     )
     task_1_metrics = train_maskable_ppo(task_1_config)
@@ -237,7 +491,7 @@ def run_mapping_variant(
         naive_config = build_single_task_config(
             ppo_finetune,
             trace_path=calibrated_paths[stage_index],
-            output_dir=variant_dir / f"naive_stage_{checkpoint_id}",
+            output_dir=seed_dir / f"naive_stage_{checkpoint_id}",
             capacity_per_task=capacity_per_task,
             init_model_path=naive_metrics["model_path"],
             init_vecnormalize_path=naive_metrics["vecnormalize_path"],
@@ -255,7 +509,7 @@ def run_mapping_variant(
             replay_variant,
             current_task_path=calibrated_paths[stage_index],
             previous_task_paths=calibrated_paths[:stage_index],
-            output_dir=variant_dir / f"replay_stage_{checkpoint_id}",
+            output_dir=seed_dir / f"replay_stage_{checkpoint_id}",
             capacity_per_task=capacity_per_task,
             init_model_path=replay_metrics["model_path"],
             init_vecnormalize_path=replay_metrics["vecnormalize_path"],
@@ -272,35 +526,147 @@ def run_mapping_variant(
         replay_rewards.append(float(replay_eval["total_reward"]))
 
     initial_reward = naive_rewards[0]
+    naive_bwt = np.asarray(naive_rewards, dtype=np.float64) - initial_reward
+    replay_bwt = np.asarray(replay_rewards, dtype=np.float64) - initial_reward
     trajectory = pd.DataFrame(
         {
             "mapping": variant,
+            "seed": seed,
             "checkpoint": checkpoint_ids,
             "stage": list(range(1, len(checkpoint_ids) + 1)),
             "naive_task_1_reward": naive_rewards,
             "replay_task_1_reward": replay_rewards,
             "reactive_stage_reward": reactive_rewards,
-            "naive_rolling_bwt": np.asarray(naive_rewards) - initial_reward,
-            "replay_rolling_bwt": np.asarray(replay_rewards) - initial_reward,
+            "naive_rolling_bwt": naive_bwt,
+            "replay_rolling_bwt": replay_bwt,
+            "naive_forgetting": np.maximum(0.0, -naive_bwt),
+            "replay_forgetting": np.maximum(0.0, -replay_bwt),
         }
     )
-    trajectory.to_csv(variant_dir / "continuous_rewards.csv", index=False)
+    trajectory.to_csv(seed_dir / "continuous_rewards.csv", index=False)
+    return trajectory
 
-    return ContinuousVariantResult(
-        summary={
-            "mapping": variant,
-            "persistent_vm_count": selected_vm_count,
-            "initial_task_1_reward": initial_reward,
-            "naive_stage_125_reward": naive_rewards[-1],
-            "replay_stage_125_reward": replay_rewards[-1],
-            "reactive_stage_125_reward": reactive_rewards[-1],
-            "naive_final_bwt": naive_rewards[-1] - initial_reward,
-            "replay_final_bwt": replay_rewards[-1] - initial_reward,
-            "naive_final_retention_pct": retention_percentage(initial_reward, naive_rewards[-1]),
-            "replay_final_retention_pct": retention_percentage(initial_reward, replay_rewards[-1]),
-        },
-        trajectory=trajectory,
+
+def summarize_variant(
+    trajectory: pd.DataFrame,
+    *,
+    mapping: str,
+    selected_vm_count: int,
+    vm_selection_strategy: str,
+    curriculum_source: str,
+    seeds: list[int],
+) -> dict[str, float | int | str]:
+    final_stage = int(trajectory["stage"].max())
+    final_rows = trajectory[trajectory["stage"] == final_stage]
+    summary: dict[str, float | int | str] = {
+        "mapping": mapping,
+        "curriculum_source": curriculum_source,
+        "vm_selection_strategy": vm_selection_strategy,
+        "selected_vm_count": selected_vm_count,
+        "seed_count": len(seeds),
+        "seeds": ",".join(str(seed) for seed in seeds),
+        "final_checkpoint": int(final_rows["checkpoint"].iloc[0]),
+    }
+    metric_columns = [
+        "initial_task_1_reward",
+        "naive_stage_final_reward",
+        "replay_stage_final_reward",
+        "reactive_stage_final_reward",
+        "naive_final_bwt",
+        "replay_final_bwt",
+        "naive_final_forgetting",
+        "replay_final_forgetting",
+    ]
+    metric_values = pd.DataFrame(
+        {
+            "initial_task_1_reward": (
+                trajectory[trajectory["stage"] == 1]
+                .sort_values("seed")["naive_task_1_reward"]
+                .to_numpy()
+            ),
+            "naive_stage_final_reward": final_rows.sort_values("seed")[
+                "naive_task_1_reward"
+            ].to_numpy(),
+            "replay_stage_final_reward": final_rows.sort_values("seed")[
+                "replay_task_1_reward"
+            ].to_numpy(),
+            "reactive_stage_final_reward": final_rows.sort_values("seed")[
+                "reactive_stage_reward"
+            ].to_numpy(),
+            "naive_final_bwt": final_rows.sort_values("seed")["naive_rolling_bwt"].to_numpy(),
+            "replay_final_bwt": final_rows.sort_values("seed")["replay_rolling_bwt"].to_numpy(),
+            "naive_final_forgetting": final_rows.sort_values("seed")["naive_forgetting"].to_numpy(),
+            "replay_final_forgetting": final_rows.sort_values("seed")[
+                "replay_forgetting"
+            ].to_numpy(),
+        }
     )
+    for column in metric_columns:
+        summary[f"{column}_mean"] = float(metric_values[column].mean())
+        std = float(metric_values[column].std(ddof=1))
+        summary[f"{column}_std"] = 0.0 if np.isnan(std) else std
+    return summary
+
+
+def matrix_demand_diagnostics(
+    matrices: list[pd.DataFrame],
+    *,
+    checkpoint_ids: list[int],
+    mapping: str,
+    curriculum_source: str,
+    vm_selection_strategy: str,
+    selected_vm_count: int,
+    min_drift_smd: float,
+    min_drift_ks: float,
+) -> pd.DataFrame:
+    demands = [matrix.sum(axis=1).to_numpy(dtype=np.float64) for matrix in matrices]
+    return demand_distribution_diagnostics(
+        demands,
+        checkpoint_ids=checkpoint_ids,
+        mapping=mapping,
+        curriculum_source=curriculum_source,
+        vm_selection_strategy=vm_selection_strategy,
+        selected_vm_count=selected_vm_count,
+        min_drift_smd=min_drift_smd,
+        min_drift_ks=min_drift_ks,
+    )
+
+
+def demand_diagnostics_from_traces(
+    traces: list[pd.DataFrame],
+    *,
+    checkpoint_ids: list[int],
+    mapping: str,
+    curriculum_source: str,
+    vm_selection_strategy: str,
+    selected_vm_count: int,
+    min_drift_smd: float,
+    min_drift_ks: float,
+) -> pd.DataFrame:
+    demands = [trace["demand"].to_numpy(dtype=np.float64) for trace in traces]
+    return demand_distribution_diagnostics(
+        demands,
+        checkpoint_ids=checkpoint_ids,
+        mapping=mapping,
+        curriculum_source=curriculum_source,
+        vm_selection_strategy=vm_selection_strategy,
+        selected_vm_count=selected_vm_count,
+        min_drift_smd=min_drift_smd,
+        min_drift_ks=min_drift_ks,
+    )
+
+
+def format_diagnostic_table(diagnostics: pd.DataFrame) -> str:
+    columns = [
+        "checkpoint",
+        "mean",
+        "std",
+        "p95",
+        "smd_vs_checkpoint_1",
+        "ks_vs_checkpoint_1",
+        "measurable_shift",
+    ]
+    return diagnostics[columns].to_string(index=False, float_format=lambda value: f"{value:.3f}")
 
 
 def preprocess_task(config: dict, cpu_matrix: pd.DataFrame, output_path: Path) -> pd.DataFrame:
@@ -386,17 +752,22 @@ def refresh_cached_reactive_baseline(
         variant_rows = trajectories[trajectories["mapping"] == variant].copy()
         if variant_rows.empty:
             continue
+        checkpoints = variant_rows["checkpoint"].drop_duplicates().astype(int).tolist()
         stage_paths = [
             output_dir / variant / f"task_{int(checkpoint)}_calibrated.csv"
-            for checkpoint in variant_rows["checkpoint"]
+            for checkpoint in checkpoints
         ]
         first_stage = pd.read_csv(stage_paths[0])
         capacity_per_task = float(first_stage["capacity_per_task"].iloc[0])
-        variant_rows["reactive_stage_reward"] = evaluate_reactive_stage_rewards(
+        reactive_rewards = evaluate_reactive_stage_rewards(
             stage_paths,
             base_config=ppo_base,
             variant_config=variant_config,
             capacity_per_task=capacity_per_task,
+        )
+        reward_by_checkpoint = dict(zip(checkpoints, reactive_rewards, strict=True))
+        variant_rows["reactive_stage_reward"] = variant_rows["checkpoint"].map(
+            reward_by_checkpoint
         )
         frames.append(variant_rows)
 
@@ -414,13 +785,27 @@ def refresh_cached_summary_with_reactive(*, output_dir: Path, trajectory: pd.Dat
         return
 
     summary = pd.read_csv(summary_path)
+    final_stage = trajectory["stage"].max()
     final_reactive = (
-        trajectory.sort_values("stage")
-        .groupby("mapping", as_index=False)
-        .tail(1)[["mapping", "reactive_stage_reward"]]
-        .rename(columns={"reactive_stage_reward": "reactive_stage_125_reward"})
+        trajectory[trajectory["stage"] == final_stage]
+        .groupby("mapping")["reactive_stage_reward"]
+        .agg(["mean", "std"])
+        .reset_index()
+        .rename(
+            columns={
+                "mean": "reactive_stage_final_reward_mean",
+                "std": "reactive_stage_final_reward_std",
+            }
+        )
     )
-    summary = summary.drop(columns=["reactive_stage_125_reward"], errors="ignore").merge(
+    summary = summary.drop(
+        columns=[
+            "reactive_stage_125_reward",
+            "reactive_stage_final_reward_mean",
+            "reactive_stage_final_reward_std",
+        ],
+        errors="ignore",
+    ).merge(
         final_reactive,
         on="mapping",
         how="left",
@@ -467,6 +852,12 @@ def with_training_overrides(base_config: dict, training_cfg: dict) -> dict:
     return config
 
 
+def with_seed(base_config: dict, *, seed: int) -> dict:
+    config = copy.deepcopy(base_config)
+    config["seed"] = int(seed)
+    return config
+
+
 def apply_reward_overrides(config: dict, variant_config: dict) -> dict:
     updated = copy.deepcopy(config)
     if "reward" in variant_config:
@@ -476,53 +867,65 @@ def apply_reward_overrides(config: dict, variant_config: dict) -> dict:
     return updated
 
 
-def retention_percentage(initial_reward: float, final_reward: float) -> float:
-    denominator = max(abs(initial_reward), 1e-6)
-    drop = max(0.0, initial_reward - final_reward)
-    return float(np.clip(100.0 * (1.0 - drop / denominator), 0.0, 100.0))
-
-
 def write_continuous_forgetting_plot(
     trajectory: pd.DataFrame,
     *,
     checkpoint_ids: list[int],
     output_path: Path,
 ) -> None:
-    plot_columns = ["naive_task_1_reward", "replay_task_1_reward"]
-    if "reactive_stage_reward" in trajectory.columns:
-        plot_columns.append("reactive_stage_reward")
-    grouped = trajectory.groupby("checkpoint", sort=False)[plot_columns].mean()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure, axis = plt.subplots(figsize=(8.5, 5.0))
-    axis.plot(
-        checkpoint_ids,
-        grouped["naive_task_1_reward"].to_numpy(),
-        marker="o",
-        linewidth=2.0,
-        label="Naive Fine-Tuning",
+    frame = trajectory.copy()
+    if "stage" not in frame.columns:
+        stage_by_checkpoint = {
+            checkpoint: index + 1 for index, checkpoint in enumerate(checkpoint_ids)
+        }
+        frame["stage"] = frame["checkpoint"].map(stage_by_checkpoint)
+    if "seed" not in frame.columns:
+        frame["seed"] = 0
+    if "naive_rolling_bwt" not in frame.columns:
+        baseline = frame.groupby(["mapping", "seed"])["naive_task_1_reward"].transform("first")
+        frame["naive_rolling_bwt"] = frame["naive_task_1_reward"] - baseline
+        frame["replay_rolling_bwt"] = frame["replay_task_1_reward"] - baseline
+
+    mappings = frame["mapping"].drop_duplicates().tolist()
+    figure, axes = plt.subplots(
+        len(mappings),
+        1,
+        figsize=(8.8, max(3.0, 2.7 * len(mappings))),
+        sharex=True,
     )
-    axis.plot(
-        checkpoint_ids,
-        grouped["replay_task_1_reward"].to_numpy(),
-        marker="o",
-        linewidth=2.0,
-        label="PPO + Replay",
-    )
-    if "reactive_stage_reward" in grouped.columns:
-        axis.plot(
-            checkpoint_ids,
-            grouped["reactive_stage_reward"].to_numpy(),
-            linestyle=":",
-            color="0.25",
-            linewidth=2.25,
-            label="Reactive Baseline",
-        )
-    axis.set_xlabel("Training Stage")
-    axis.set_ylabel("Task 1 Reward")
-    axis.set_title("Continuous Forgetting Across Azure Checkpoints")
-    axis.set_xticks(checkpoint_ids)
-    axis.grid(True, alpha=0.25)
-    axis.legend(frameon=False)
+    if len(mappings) == 1:
+        axes = [axes]
+
+    method_columns = [
+        ("naive_rolling_bwt", "Naive Fine-Tuning", "tab:red"),
+        ("replay_rolling_bwt", "PPO + Replay", "tab:blue"),
+    ]
+    for axis, mapping in zip(axes, mappings, strict=True):
+        subset = frame[frame["mapping"] == mapping]
+        for column, label, color in method_columns:
+            grouped = (
+                subset.groupby("stage", sort=True)[column]
+                .agg(["mean", "std"])
+                .reindex(range(1, len(checkpoint_ids) + 1))
+            )
+            x = grouped.index.to_numpy(dtype=float)
+            mean = grouped["mean"].to_numpy(dtype=float)
+            std = grouped["std"].fillna(0.0).to_numpy(dtype=float)
+            axis.plot(x, mean, marker="o", linewidth=2.0, color=color, label=label)
+            axis.fill_between(x, mean - std, mean + std, color=color, alpha=0.16, linewidth=0)
+        axis.axhline(0.0, color="0.45", linewidth=0.9)
+        axis.axvline(1.5, color="0.25", linestyle="--", linewidth=1.0)
+        axis.text(1.52, 0.96, "drift onset", transform=axis.get_xaxis_transform(), fontsize=8)
+        axis.set_ylabel("Task 1 BWT")
+        axis.set_title(f"{mapping.capitalize()} mapping")
+        axis.grid(True, alpha=0.25)
+        axis.legend(frameon=False, loc="best")
+
+    axes[-1].set_xlabel("Training Stage")
+    axes[-1].set_xticks(range(1, len(checkpoint_ids) + 1))
+    axes[-1].set_xticklabels([str(checkpoint) for checkpoint in checkpoint_ids])
+    figure.suptitle("Signed Backward Transfer Across Azure Checkpoints", y=0.995)
     figure.tight_layout()
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -531,15 +934,16 @@ def write_continuous_forgetting_plot(
 def to_markdown_table(frame: pd.DataFrame) -> str:
     headers = [
         "Mapping",
+        "Source",
         "VMs",
-        "Initial Task 1 Reward",
-        "Naive Stage 125 Reward",
-        "Replay Stage 125 Reward",
-        "Reactive Stage 125 Reward",
-        "Naive Final BWT",
-        "Replay Final BWT",
-        "Naive Retention",
-        "Replay Retention",
+        "Seeds",
+        "Initial Task 1",
+        "Naive Final",
+        "Replay Final",
+        "Naive BWT",
+        "Replay BWT",
+        "Naive Forgetting",
+        "Replay Forgetting",
     ]
     rows = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
     for row in frame.to_dict("records"):
@@ -548,20 +952,29 @@ def to_markdown_table(frame: pd.DataFrame) -> str:
             + " | ".join(
                 [
                     str(row["mapping"]),
-                    f"{int(row['persistent_vm_count'])}",
-                    f"{float(row['initial_task_1_reward']):.3f}",
-                    f"{float(row['naive_stage_125_reward']):.3f}",
-                    f"{float(row['replay_stage_125_reward']):.3f}",
-                    f"{float(row['reactive_stage_125_reward']):.3f}",
-                    f"{float(row['naive_final_bwt']):.3f}",
-                    f"{float(row['replay_final_bwt']):.3f}",
-                    f"{float(row['naive_final_retention_pct']):.1f}%",
-                    f"{float(row['replay_final_retention_pct']):.1f}%",
+                    str(row.get("curriculum_source", "azure")),
+                    f"{int(row['selected_vm_count'])}",
+                    f"{int(row['seed_count'])}",
+                    mean_std(row, "initial_task_1_reward"),
+                    mean_std(row, "naive_stage_final_reward"),
+                    mean_std(row, "replay_stage_final_reward"),
+                    mean_std(row, "naive_final_bwt"),
+                    mean_std(row, "replay_final_bwt"),
+                    mean_std(row, "naive_final_forgetting"),
+                    mean_std(row, "replay_final_forgetting"),
                 ]
             )
             + " |"
         )
     return "\n".join(rows)
+
+
+def mean_std(row: dict[str, Any], prefix: str) -> str:
+    mean = float(row[f"{prefix}_mean"])
+    std = float(row[f"{prefix}_std"])
+    if np.isnan(std):
+        std = 0.0
+    return f"{mean:.3f} +/- {std:.3f}"
 
 
 if __name__ == "__main__":

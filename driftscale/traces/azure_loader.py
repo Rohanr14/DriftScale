@@ -8,6 +8,7 @@ preprocessed samples. This loader accepts explicit column names when known, but 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -38,14 +39,23 @@ class ChronologicalSplit:
     selected_vms: list[str]
 
 
+class VmSelectionStrategy(StrEnum):
+    """Checkpoint VM cohort selection modes for Azure curricula."""
+
+    PERSISTENT_DENSE = "persistent_dense"
+    PER_CHECKPOINT_DENSE = "per_checkpoint_dense"
+
+
 @dataclass(frozen=True)
 class AzureCheckpointRegimes:
-    """Sequential dense CPU matrices for persistent VMs across Azure shards."""
+    """Sequential dense CPU matrices for Azure checkpoint shards."""
 
     checkpoint_ids: list[int]
     paths: list[Path]
     selected_vms: list[str]
+    selected_vms_by_checkpoint: list[list[str]]
     matrices: list[pd.DataFrame]
+    selection_strategy: str = VmSelectionStrategy.PER_CHECKPOINT_DENSE
 
 
 _COLUMN_ALIASES = {
@@ -265,6 +275,34 @@ def scan_persistent_dense_vms(
     return persistent_counts.head(vm_count).index.astype(str).tolist()
 
 
+def scan_checkpoint_dense_vms(
+    raw_csv_paths: list[str | Path],
+    *,
+    vm_count: int = 1000,
+    chunksize: int = 250_000,
+    max_rows: int | None = None,
+) -> list[list[str]]:
+    """Select each Azure checkpoint shard's own densest VM IDs.
+
+    This intentionally preserves workload composition drift across checkpoints instead of forcing
+    the same VM intersection through the whole curriculum.
+    """
+    paths = [Path(path) for path in raw_csv_paths]
+    if not paths:
+        raise ValueError("raw_csv_paths must include at least one Azure shard")
+    if vm_count <= 0:
+        raise ValueError("vm_count must be positive")
+
+    selected_by_checkpoint = []
+    for path in paths:
+        shard_counts = _count_vm_observations(path, chunksize=chunksize, max_rows=max_rows)
+        selected = shard_counts.sort_values(ascending=False).head(vm_count)
+        if selected.empty:
+            raise ValueError(f"no VM IDs found in {path}")
+        selected_by_checkpoint.append(selected.index.astype(str).tolist())
+    return selected_by_checkpoint
+
+
 def load_persistent_vm_matrix(
     raw_csv_path: str | Path,
     *,
@@ -316,10 +354,11 @@ def load_azure_checkpoint_regimes(
     raw_dir: str | Path = DEFAULT_AZURE_RAW_DIR,
     checkpoint_ids: tuple[int, ...] = AZURE_CHECKPOINT_IDS,
     vm_count: int = 1000,
+    selection_strategy: str | VmSelectionStrategy = VmSelectionStrategy.PER_CHECKPOINT_DENSE,
     chunksize: int = 250_000,
     max_rows: int | None = None,
 ) -> AzureCheckpointRegimes:
-    """Load six chronological Azure checkpoint matrices over the same persistent VMs."""
+    """Load chronological Azure checkpoint matrices with a configurable VM cohort strategy."""
     paths = [Path(path) for path in raw_csv_paths] if raw_csv_paths else azure_checkpoint_paths(
         raw_dir,
         checkpoint_ids=checkpoint_ids,
@@ -330,26 +369,42 @@ def load_azure_checkpoint_regimes(
         if not path.exists():
             raise FileNotFoundError(path)
 
-    selected_vms = scan_persistent_dense_vms(
-        paths,
-        vm_count=vm_count,
-        chunksize=chunksize,
-        max_rows=max_rows,
-    )
-    matrices = [
-        load_persistent_vm_matrix(
-            path,
-            selected_vms=selected_vms,
+    strategy = VmSelectionStrategy(str(selection_strategy))
+    if strategy == VmSelectionStrategy.PERSISTENT_DENSE:
+        selected_vms = scan_persistent_dense_vms(
+            paths,
+            vm_count=vm_count,
             chunksize=chunksize,
             max_rows=max_rows,
         )
-        for path in paths
+        selected_by_checkpoint = [selected_vms] * len(paths)
+    elif strategy == VmSelectionStrategy.PER_CHECKPOINT_DENSE:
+        selected_by_checkpoint = scan_checkpoint_dense_vms(
+            paths,
+            vm_count=vm_count,
+            chunksize=chunksize,
+            max_rows=max_rows,
+        )
+        selected_vms = selected_by_checkpoint[0]
+    else:  # pragma: no cover - StrEnum construction validates this path.
+        raise AssertionError(f"unhandled VM selection strategy {strategy}")
+
+    matrices = [
+        load_persistent_vm_matrix(
+            path,
+            selected_vms=checkpoint_vms,
+            chunksize=chunksize,
+            max_rows=max_rows,
+        )
+        for path, checkpoint_vms in zip(paths, selected_by_checkpoint, strict=True)
     ]
     return AzureCheckpointRegimes(
         checkpoint_ids=list(checkpoint_ids),
         paths=paths,
         selected_vms=selected_vms,
+        selected_vms_by_checkpoint=selected_by_checkpoint,
         matrices=matrices,
+        selection_strategy=str(strategy),
     )
 
 

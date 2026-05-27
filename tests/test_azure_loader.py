@@ -9,6 +9,7 @@ from driftscale.traces.azure_loader import (
     load_azure_checkpoint_regimes,
     load_azure_cpu_matrix,
     load_dense_azure_cpu_matrix,
+    scan_checkpoint_dense_vms,
     scan_persistent_dense_vms,
 )
 from driftscale.traces.preprocess import DemandMappingConfig, build_preprocessed_trace
@@ -89,7 +90,7 @@ def test_dense_headerless_azure_loader_selects_top_vms_and_splits(tmp_path) -> N
     assert len(split.task_b) == 2
 
 
-def test_checkpoint_loader_intersects_persistent_vms_and_preserves_regime_order(
+def test_checkpoint_loader_supports_persistent_and_per_checkpoint_vm_cohorts(
     tmp_path,
 ) -> None:
     raw_files = [
@@ -100,6 +101,7 @@ def test_checkpoint_loader_intersects_persistent_vms_and_preserves_regime_order(
                 "0,vm-b,0,20,20",
                 "0,vm-c,0,30,30",
                 "1,vm-a,0,40,40",
+                "1,vm-b,0,20,20",
                 "2,vm-a,0,50,50",
             ],
         ),
@@ -108,8 +110,10 @@ def test_checkpoint_loader_intersects_persistent_vms_and_preserves_regime_order(
             [
                 "0,vm-a,0,11,11",
                 "0,vm-b,0,21,21",
+                "0,vm-c,0,31,31",
                 "1,vm-a,0,41,41",
                 "1,vm-c,0,31,31",
+                "2,vm-c,0,51,51",
             ],
         ),
         _write_headerless_azure_gzip(
@@ -118,24 +122,40 @@ def test_checkpoint_loader_intersects_persistent_vms_and_preserves_regime_order(
                 "0,vm-a,0,12,12",
                 "0,vm-b,0,22,22",
                 "1,vm-a,0,42,42",
+                "1,vm-b,0,52,52",
                 "1,vm-c,0,32,32",
+                "2,vm-b,0,62,62",
             ],
         ),
     ]
 
-    selected = scan_persistent_dense_vms(raw_files, vm_count=2, chunksize=2)
-    regimes = load_azure_checkpoint_regimes(
+    persistent = scan_persistent_dense_vms(raw_files, vm_count=2, chunksize=2)
+    per_checkpoint = scan_checkpoint_dense_vms(raw_files, vm_count=2, chunksize=2)
+    persistent_regimes = load_azure_checkpoint_regimes(
+        raw_files,
+        checkpoint_ids=(1, 25, 50),
+        vm_count=2,
+        selection_strategy="persistent_dense",
+        chunksize=2,
+    )
+    checkpoint_regimes = load_azure_checkpoint_regimes(
         raw_files,
         checkpoint_ids=(1, 25, 50),
         vm_count=2,
         chunksize=2,
     )
 
-    assert selected == ["vm-a", "vm-b"]
-    assert regimes.checkpoint_ids == [1, 25, 50]
-    assert regimes.selected_vms == ["vm-a", "vm-b"]
-    assert [matrix.shape for matrix in regimes.matrices] == [(3, 2), (2, 2), (2, 2)]
-    assert np.isclose(regimes.matrices[1].loc[1, "vm-b"], 0.21)
+    assert persistent == ["vm-a", "vm-b"]
+    assert per_checkpoint == [["vm-a", "vm-b"], ["vm-c", "vm-a"], ["vm-b", "vm-a"]]
+    assert persistent_regimes.selection_strategy == "persistent_dense"
+    assert persistent_regimes.selected_vms_by_checkpoint == [["vm-a", "vm-b"]] * 3
+    assert checkpoint_regimes.selection_strategy == "per_checkpoint_dense"
+    assert checkpoint_regimes.checkpoint_ids == [1, 25, 50]
+    assert checkpoint_regimes.selected_vms == ["vm-a", "vm-b"]
+    assert checkpoint_regimes.selected_vms_by_checkpoint == per_checkpoint
+    assert [matrix.columns.tolist() for matrix in checkpoint_regimes.matrices] == per_checkpoint
+    assert [matrix.shape for matrix in checkpoint_regimes.matrices] == [(3, 2), (3, 2), (3, 2)]
+    assert np.isclose(checkpoint_regimes.matrices[1].loc[2, "vm-c"], 0.51)
 
 
 def _write_headerless_azure_gzip(path, rows: list[str]):
