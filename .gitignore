@@ -15,10 +15,22 @@ results/**
 !results/sensitivity/summary.md
 !results/sensitivity/continuous_rewards.csv
 !results/sensitivity/demand_diagnostics.csv
+!results/sensitivity/per_seed_bwt.csv
+!results/sensitivity/per_stage_rewards.csv
 !results/sensitivity/*/
 !results/sensitivity/*/continuous_rewards.csv
+!results/sensitivity/*/per_seed_bwt.csv
+!results/sensitivity/*/per_stage_rewards.csv
 !results/sensitivity/*/task_*_calibrated.csv
 !results/sensitivity/*/episode_rollout_curriculum.csv
+!results/replay_ratio_ablation/
+!results/replay_ratio_ablation/per_seed_bwt.csv
+!results/replay_ratio_ablation/summary.csv
+!results/replay_ratio_ablation/summary.md
+# Block model artifacts (.zip from MaskablePPO) and VecNormalize pickles.
+*.zip
+*.pkl
+results/**/*.log
 data/
 !data/
 !data/samples/

@@ -1,4 +1,4 @@
-.PHONY: setup test lint fetch-data preprocess calibrate train-baseline drift-experiment sensitivity-suite post-eval deploy-demo live-demo destroy-demo plots phase1 random-run eval clean
+.PHONY: setup test lint fetch-data preprocess calibrate train-baseline drift-experiment sensitivity-suite replay-ratio-ablation post-eval deploy-demo live-demo destroy-demo plots phase1 random-run eval clean quickcheck
 
 setup:
 	uv sync --extra dev
@@ -28,9 +28,25 @@ drift-experiment: calibrate
 sensitivity-suite:
 	@uv run --extra train python scripts/run_sensitivity_analysis.py
 
+replay-ratio-ablation:
+	@uv run --extra train python scripts/run_replay_ratio_ablation.py
+
 post-eval:
 	uv run --extra train python scripts/run_sensitivity_analysis.py --plot-only
 	uv run --extra train python scripts/plot_episode_rollout.py --plot-only
+	uv run --extra train python scripts/plot_cost_vs_slo.py
+	uv run --extra train python scripts/plot_episode_rollout_comparison.py
+
+# Tiny end-to-end smoke run: 2 seeds and small timesteps so a reviewer can confirm wiring in <5 min.
+# Does NOT replace `make sensitivity-suite` for publishable numbers.
+quickcheck:
+	@uv run --extra train python scripts/run_sensitivity_analysis.py \
+		--seed-count 2 \
+		--task-1-timesteps 256 \
+		--finetune-timesteps 256 \
+		--bootstrap-resamples 200 \
+		--output-dir results/sensitivity_quickcheck \
+		--plot-path media/continuous_forgetting_quickcheck.png
 
 deploy-demo:
 	cd infra/terraform && terraform init
@@ -56,4 +72,4 @@ random-run:
 eval: phase1
 
 clean:
-	rm -rf .pytest_cache .ruff_cache results/phase1 results/caches results/calibration results/ppo_vanilla results/drift_experiment results/sensitivity media/cost_vs_slo.png media/continuous_forgetting.png media/episode_rollout.png
+	rm -rf .pytest_cache .ruff_cache results/phase1 results/caches results/calibration results/ppo_vanilla results/drift_experiment results/sensitivity results/sensitivity_quickcheck results/replay_ratio_ablation media/cost_vs_slo.png media/continuous_forgetting.png media/continuous_forgetting_quickcheck.png media/episode_rollout.png media/episode_rollout_comparison.png media/replay_ratio_ablation.png
