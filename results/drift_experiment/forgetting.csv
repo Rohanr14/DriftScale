@@ -1,0 +1,3 @@
+method,task_a_reward_before_b,task_a_reward_after_b,bwt,forgetting,retention_ratio,task_a_slo_after_b,task_a_scale_actions_after_b
+naive_finetuning,-52.79071569442749,-55.07851839065552,-2.2878026962280273,2.2878026962280273,0.9566627831024173,0.05,18
+ppo_replay,-52.79071569442749,-41.20057165622711,11.590144038200378,0.0,1.0,0.05,19

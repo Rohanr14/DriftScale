@@ -1,0 +1,34 @@
+name: threshold
+
+loader:
+  raw_csv_path: data/raw/vm_cpu_readings-file-1-of-125.csv.gz
+  vm_count: 1000
+  chunksize: 250000
+  max_rows:
+
+mapping:
+  variant: threshold
+  scale_factor: 1.0
+  alpha: 2.0
+  spike_threshold: 0.90
+
+calibration:
+  target_slo_min: 0.01
+  target_slo_max: 0.05
+
+reward:
+  cost_weight: 1.0
+  cost_per_task_step: 0.20
+  slo_weight: 50.0
+  action_weight: 2.0
+  overprovision_weight: 10.0
+  max_penalty_ratio: 1.0
+
+training:
+  total_timesteps: 1024
+  task_a_timesteps: 20000
+  finetune_timesteps: 8192
+  continuous_task_1_timesteps: 4096
+  continuous_finetune_timesteps: 2048
+  replay_mix_ratio: 0.25
+  n_envs: 4

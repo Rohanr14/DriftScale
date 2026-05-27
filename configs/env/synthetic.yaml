@@ -1,0 +1,28 @@
+seed: 7
+regime: bursty
+length: 288
+step_minutes: 5
+noise: 0.04
+
+env:
+  min_tasks: 1
+  max_tasks: 20
+  initial_tasks: 4
+  capacity_per_task: 1.0
+  strict_action_mask: true
+
+reward:
+  cost_weight: 1.0
+  cost_per_task_step: 0.05
+  slo_weight: 50.0
+  action_weight: 0.5
+  overprovision_weight: 2.0
+  max_penalty_ratio: 1.0
+
+reactive:
+  high_threshold: 0.70
+  low_threshold: 0.30
+  scale_up_after: 1
+  scale_down_after: 6
+  scale_step: 2
+

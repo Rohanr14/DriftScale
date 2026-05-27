@@ -1,0 +1,34 @@
+aws:
+  region: us-east-1
+  terraform_dir: infra/terraform
+
+ecs:
+  cluster_name:
+  service_name:
+
+alb:
+  arn_suffix:
+  target_group_arn_suffix:
+
+policy:
+  model_path: results/sensitivity/linear/replay_stage_125/model.zip
+  vecnormalize_path: results/sensitivity/linear/replay_stage_125/vecnormalize.pkl
+  deterministic: true
+  observation_min_tasks: 1
+  observation_max_tasks: 20
+
+safety:
+  min_tasks: 1
+  max_tasks: 6
+  cooldown_seconds: 60
+  max_scale_delta: 1
+
+controller:
+  interval_seconds: 30
+  max_iterations: 12
+  metric_period_seconds: 60
+  metric_lookback_minutes: 10
+  latency_slo_seconds: 0.75
+
+load:
+  k6_script: load/k6_script.js

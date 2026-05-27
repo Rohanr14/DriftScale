@@ -1,0 +1,4 @@
+policy,total_reward,total_resource_cost,total_scaling_cost,slo_violation_rate,scale_action_count,mean_task_count,mean_overprovision_ratio,final_task_count,total_cost
+static_median,-15.952526562984097,2.0000000000000004,0.0,0.05,0,2.0,0.3483665883541107,2,2.0000000000000004
+static_p95,-15.952526562984097,2.0000000000000004,0.0,0.05,0,2.0,0.3483665883541107,2,2.0000000000000004
+reactive_threshold,-26.622632463773094,3.0,1.0,0.0,1,3.0,0.5655657649040222,3,4.0

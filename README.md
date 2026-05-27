@@ -4,9 +4,45 @@
 
 ## Demo
 
-*(Placeholder: Loom link coming soon)*
+Phase 1 through Week 4 are implemented and run locally: synthetic workload generation,
+the `DriftScaleEnv` Gymnasium environment, reward accounting, action masks, static baselines,
+reactive threshold autoscaling, Azure-shaped trace loading, trace-to-demand preprocessing,
+baseline calibration, MaskablePPO training, and the first cost/SLO plot.
 
-> **Watch the DriftScale Demo:** A 5-minute walkthrough of the architecture, simulation loop, forgetting metrics, and a live validation run on AWS ECS.
+The later Loom/AWS demo will come after the Azure/PPO/replay phases.
+
+## Current Status
+
+**Phase 1 complete:** repo scaffold, synthetic env, reward model, reactive baseline, static
+baselines, masked random-policy smoke run, and unit tests.
+
+**Week 2 complete:** Azure CSV loader, timestamp alignment, deterministic VM subsetting,
+vectorized §5.5 demand mappings, tiny local Azure-shaped sample, and cache generation.
+
+**Weeks 3-4 complete:** baseline calibration into the static-p95 1-5% SLO band,
+`MaskablePPO` with `VecNormalize`, saved PPO artifacts, and `media/cost_vs_slo.png`.
+
+**Weeks 5-6 complete:** abrupt Task A -> Task B drift setup, BWT/forgetting metrics,
+naive fine-tuning, and interleaved replay via mixed vectorized environments.
+
+**Sensitivity suite complete:** real local Azure V1 shard loading, top-1,000 dense VM
+selection, chronological Task A/B split, and §5.5 linear/convex/threshold BWT comparison.
+
+Validated locally:
+
+```bash
+make setup
+make test
+make lint
+make preprocess
+make calibrate
+make train-baseline
+make drift-experiment
+make fetch-data
+make sensitivity-suite
+make random-run
+make phase1
+```
 
 ## Why This Matters
 
@@ -29,7 +65,7 @@ DriftScale operates on two distinct paths:
 
 ## Quickstart
 
-This project is built with Python 3.11+ and uses `uv` (or `poetry`) for dependency management.
+This project is built with Python 3.11+ and uses `uv` for dependency management.
 
 ```bash
 # 1. Install dependencies
@@ -38,35 +74,64 @@ make setup
 # 2. Run test suite
 make test
 
-# 3. Preprocess the Azure traces (generates episodes based on configs)
+# 3. Build the tiny Azure V1-style demand cache
 make preprocess
 
-# 4. Train the baseline (Vanilla PPO)
+# 4. Calibrate scale/capacity and baseline metrics
+make calibrate
+
+# 5. Train the vanilla MaskablePPO baseline and generate the cost/SLO plot
 make train-baseline
 
-# 5. Train with Replay continual learning
-make train-replay
+# 6. Run abrupt drift and replay forgetting evaluation
+make drift-experiment
 
-# 6. Evaluate all policies and generate metrics
-make eval
+# 7. Materialize the top-1,000 dense VM matrix from the real local Azure shard
+make fetch-data
 
-# 7. Generate cost, SLO, and forgetting plots
-make plots
+# 8. Run chronological Task A/B sensitivity across linear, convex, and threshold mappings
+make sensitivity-suite
 
-```
+# 9. Run the masked random-policy smoke test
+make random-run
 
-For the AWS validation loop:
-
-```bash
-make deploy-demo  # Provisions Terraform infra (VPC, ALB, ECS)
-make live-demo    # Runs the k6 load generator and RL control loop
-make destroy-demo # Tears down all AWS resources
-
+# 10. Evaluate Phase 1 static and reactive baselines
+make phase1
 ```
 
 ## Results
 
-*(Note: These are target benchmarks; actual empirical results will be updated post-evaluation).*
+Phase 1 currently evaluates the synthetic bursty regime from `configs/env/synthetic.yaml`.
+The latest local run produced:
+
+| Policy | SLO violation rate | Mean tasks | Scale actions |
+| --- | ---: | ---: | ---: |
+| Reactive threshold | 0.000 | 12.87 | 30 |
+| Static median | 0.326 | 4.00 | 0 |
+| Static p95 | 0.049 | 12.00 | 0 |
+
+This satisfies the Week 1 acceptance check: random policy runs, reactive beats static median
+on SLO, and unit tests pass.
+
+Later phases will replace this section with Azure trace results, PPO, replay, forgetting, and
+cost/SLO plots.
+
+Week 2 preprocessing writes a lightweight cache to `results/caches/azure_v1_linear.csv` from the
+tiny sample at `data/samples/azure_v1_tiny.csv`. The mapping is configured in
+`configs/env/azure_v1.yaml`, including the threshold variant's tunable `alpha`.
+
+Week 3 calibration writes `results/caches/azure_v1_calibrated.csv` and
+`results/calibration/baseline_metrics.csv`. Week 4 training saves
+`results/ppo_vanilla/model.zip`, `results/ppo_vanilla/vecnormalize.pkl`, and
+`results/ppo_vanilla/metrics.csv`; the initial plot is saved to `media/cost_vs_slo.png`.
+
+Weeks 5-6 write `results/drift_experiment/forgetting.csv` and three saved policy stages:
+Task A pre-drift, naive Task B fine-tuning, and Task B fine-tuning with interleaved replay.
+
+The sensitivity suite reads the real local Azure V1 shard at
+`data/raw/vm_cpu_readings-file-1-of-125.csv.gz`, selects the 1,000 VMs with the most readings,
+pivots a dense CPU matrix, and splits it chronologically into Task A and Task B. It writes
+`results/sensitivity/summary.md`. No synthetic fallback or artificial Task B multiplier is used.
 
 **Primary Evaluation: Catastrophic Forgetting vs. Adaptation**
 
@@ -116,6 +181,8 @@ Because Azure VM CPU traces represent utilization rather than direct service req
 
 ## AWS Demo
 
+Planned for a later phase. Phase 1 intentionally does not deploy cloud resources.
+
 To validate that the RL controller can safely interface with cloud APIs, a small-scale, safety-constrained live demo is included.
 
 * **Stack:** Terraform, ECS Fargate, Docker, FastAPI, Application Load Balancer, `k6`, CloudWatch, `boto3`.
@@ -131,6 +198,6 @@ To validate that the RL controller can safely interface with cloud APIs, a small
 
 ## Lessons Learned
 
-* **Continual Learning Realities:** EWC + actor-critic proved brittle due to Fisher information matrices destabilizing the value function. Interleaved replay was theoretically simpler but drastically more reproducible.
-* **Reward Hacking:** RL agents are ruthless. Initial penalty weights led to degenerate exploits (e.g., permanently collapsing to minimum tasks and eating the SLO penalty to save cost). Clipping penalties and observation normalization via `VecNormalize` were mandatory for stability.
-* **Cloud API Lag:** Real CloudWatch metric ingestion has inherent delays. Translating simulated instantaneous state into an asynchronous, lagged AWS control loop required extensive tuning of the controller's safety cooldowns.
+* **Start with simulator invariants:** Phase 1 focuses on normalized observations, explicit reward components, and tests before training any policy.
+* **Mask invalid scale actions early:** Boundary actions are exposed through `action_masks()` so later MaskablePPO training does not learn from silently clamped actions.
+* **Reactive is a serious reference:** On the bursty synthetic regime, reactive autoscaling materially reduces SLO violations versus static median while carrying the expected higher task cost.

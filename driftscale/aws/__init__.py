@@ -1,0 +1,1 @@
+"""AWS validation demo helpers."""

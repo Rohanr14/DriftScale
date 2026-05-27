@@ -1,0 +1,48 @@
+seed: 7
+output_dir: results/ppo_vanilla
+trace:
+  path: results/caches/azure_v1_calibrated.csv
+  demand_column: demand
+env:
+  min_tasks: 1
+  max_tasks: 20
+  initial_tasks: 1
+  capacity_per_task: 1.0
+  scale_factor: 0.7094733777135179
+  step_minutes: 5
+  strict_action_mask: true
+reward:
+  cost_weight: 1.0
+  cost_per_task_step: 0.05
+  slo_weight: 50.0
+  action_weight: 2.0
+  overprovision_weight: 2.0
+  max_penalty_ratio: 1.0
+ppo:
+  total_timesteps: 1024
+  learning_rate: 0.0003
+  n_steps: 64
+  batch_size: 32
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  verbose: 0
+vecnormalize:
+  norm_obs: true
+  norm_reward: true
+  clip_obs: 10.0
+  clip_reward: 100.0
+eval:
+  deterministic: false
+calibration:
+  source_trace_path: results/caches/azure_v1_linear.csv
+  calibrated_trace_path: results/caches/azure_v1_calibrated.csv
+  metrics_path: results/calibration/baseline_metrics.csv
+  target_slo_min: 0.01
+  target_slo_max: 0.05
+  scale_factor: 0.7094733777135179
+  capacity_per_task: 1.0

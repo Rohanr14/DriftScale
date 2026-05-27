@@ -1,0 +1,28 @@
+raw_csv_path: data/samples/azure_v2_tiny.csv
+output_path: results/caches/azure_v2_linear.csv
+
+loader:
+  vm_count: 5
+  has_header: true
+  max_rows:
+  timestamp_unit:
+  fill_method: interpolate
+  columns:
+    timestamp: timestamp
+    vm_id: vm_id
+    cpu: avg_cpu
+
+mapping:
+  variant: linear
+  scale_factor: 1.0
+  alpha: 2.0
+  spike_threshold: 0.90
+
+env:
+  trace_path: results/caches/azure_v2_linear.csv
+  demand_column: demand
+  min_tasks: 1
+  max_tasks: 20
+  initial_tasks: 4
+  capacity_per_task: 1.0
+

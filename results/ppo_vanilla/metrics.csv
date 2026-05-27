@@ -1,0 +1,2 @@
+total_reward,total_resource_cost,total_scaling_cost,total_cost,slo_violation_rate,slo_violation_count,scale_action_count,mean_task_count,mean_overprovision_ratio,final_task_count,steps,policy,model_path
+-43.646703124046326,4.8999999999999995,12.0,16.9,0.05,1,17,4.9,0.6682208302049409,7,20,ppo_vanilla,results/ppo_vanilla/model.zip

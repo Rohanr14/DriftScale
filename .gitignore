@@ -3,6 +3,23 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# DriftScale generated/local artifacts
+results/
+media/
+data/
+!data/
+!data/samples/
+!data/samples/*.csv
+data/raw/
+data/caches/
+data/**/*.csv.gz
+data/**/*.parquet
+*.log
+
 # C extensions
 *.so
 
@@ -216,3 +233,29 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# DriftScale source configs live under configs/env; keep virtualenv ignores above intact.
+!configs/
+!configs/env/
+!configs/env/*.yaml
+!configs/train/
+!configs/train/*.yaml
+!configs/aws/
+!configs/aws/*.yaml
+
+# Terraform local state and secrets
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local demo outputs
+k6-summary.json
+load/results/

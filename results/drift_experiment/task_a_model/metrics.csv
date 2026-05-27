@@ -1,0 +1,2 @@
+total_reward,total_resource_cost,total_scaling_cost,total_cost,slo_violation_rate,slo_violation_count,scale_action_count,mean_task_count,mean_overprovision_ratio,final_task_count,steps,policy,model_path
+-52.79071569442749,4.0,12.5,16.5,0.05,1,17,4.0,0.6096301553646724,2,20,ppo_vanilla,results/drift_experiment/task_a_model/model.zip

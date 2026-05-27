@@ -1,0 +1,56 @@
+seed: 7
+output_dir: results/drift_experiment/replay_finetune_b
+
+task_a:
+  path: results/caches/azure_v1_calibrated.csv
+  demand_column: demand
+
+task_b:
+  path: results/caches/azure_v2_calibrated.csv
+  demand_column: demand
+
+init_model_path: results/drift_experiment/task_a_model/model.zip
+init_vecnormalize_path: results/drift_experiment/task_a_model/vecnormalize.pkl
+
+replay:
+  n_envs: 4
+  replay_mix_ratio: 0.25
+
+env:
+  min_tasks: 1
+  max_tasks: 20
+  initial_tasks: 1
+  capacity_per_task: 1.0
+  step_minutes: 5
+  strict_action_mask: true
+
+reward:
+  cost_weight: 1.0
+  cost_per_task_step: 0.05
+  slo_weight: 50.0
+  action_weight: 2.0
+  overprovision_weight: 2.0
+  max_penalty_ratio: 1.0
+
+ppo:
+  total_timesteps: 1024
+  learning_rate: 0.0003
+  n_steps: 32
+  batch_size: 32
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  verbose: 0
+
+vecnormalize:
+  norm_obs: true
+  norm_reward: true
+  clip_obs: 10.0
+  clip_reward: 100.0
+
+eval:
+  deterministic: true

@@ -1,0 +1,9 @@
+{
+  "scale_factor": 0.7094733777135179,
+  "capacity_per_task": 1.0,
+  "static_p95_task_count": 2,
+  "static_p95_slo_violation_rate": 0.05,
+  "target_min": 0.01,
+  "target_max": 0.05,
+  "in_target": true
+}

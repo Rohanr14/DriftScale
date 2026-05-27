@@ -1,0 +1,2 @@
+total_reward,total_resource_cost,total_scaling_cost,total_cost,slo_violation_rate,slo_violation_count,scale_action_count,mean_task_count,mean_overprovision_ratio,final_task_count,steps,policy,model_path
+-50.44468864798546,14.200000000000008,1.5,15.700000000000008,0.02857142857142857,1,3,2.0285714285714285,0.09898921762193952,2,35,ppo_vanilla,results/sensitivity/linear/task_a_model/model.zip

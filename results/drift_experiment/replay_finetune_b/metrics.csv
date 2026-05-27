@@ -1,0 +1,2 @@
+total_reward,total_resource_cost,total_scaling_cost,total_cost,slo_violation_rate,slo_violation_count,scale_action_count,mean_task_count,mean_overprovision_ratio,final_task_count,steps,policy,model_path,vecnormalize_path,metrics_path,replay_mix_ratio,task_a_envs,task_b_envs
+-41.20057165622711,3.25,15.0,18.25,0.05,1,19,3.25,0.5472851856052876,3,20,ppo_replay,results/drift_experiment/replay_finetune_b/model.zip,results/drift_experiment/replay_finetune_b/vecnormalize.pkl,results/drift_experiment/replay_finetune_b/metrics.csv,0.25,1,3
