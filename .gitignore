@@ -9,7 +9,6 @@ Thumbs.db
 
 # DriftScale generated/local artifacts
 results/
-media/
 data/
 !data/
 !data/samples/
